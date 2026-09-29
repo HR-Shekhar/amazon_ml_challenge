@@ -5,7 +5,8 @@ Every record gets:
 * ``name_raw`` / ``addr_raw``   - original text, lower-cased (the "raw" view)
 * ``name_norm``                 - transliterated, accent-folded, punctuation-free name
 * ``name_core``                 - ``name_norm`` without legal suffixes / honorifics /
-                                  alias markers, with in-word digit typos repaired
+                                  alias markers (including transliterations such as
+                                  ``praivet`` / ``limatid``), with in-word digit typos repaired
 * ``name_compact``              - ``name_core`` with spaces removed (catches
                                   ``bengalurufinvest.com`` vs ``Bengaluru Finvest``)
 * ``addr_norm``                 - transliterated, accent-folded address with common
@@ -190,6 +191,14 @@ _SKEL_MAP = str.maketrans({"c": "k", "q": "k", "x": "ks", "z": "s", "j": "s", "w
 _SKEL_VOWELS = re.compile(r"[aeiouy]")
 _SKEL_REPEAT = re.compile(r"(.)\1+")
 SKELETON_STOP = frozenset("prvt pvt lmtd ltd llp llk lls pr l lt lmt nk ink krp krprsn krprtn kmpn".split())
+# Transliterations of legal words seen in the training names. A skeleton match alone is not
+# enough: smith/summit share a skeleton with "smt", and parvati shares one with "private".
+PHONETIC_LEGAL_TOKENS = frozenset(
+    """
+    praivet piraivet limatid
+    bijanes bisines bijines bijhanes bisinas bijanas
+    """.split()
+)
 
 
 def skeleton_word(w: str) -> str:
@@ -199,6 +208,37 @@ def skeleton_word(w: str) -> str:
         w = w.replace(a, b)
     w = _SKEL_SOFT_G.sub("j", _SKEL_SOFT_C.sub("s", w)).translate(_SKEL_MAP)
     return _SKEL_REPEAT.sub(r"\1", _SKEL_VOWELS.sub("", w))
+
+
+def _edit_distance(a: str, b: str) -> int:
+    if abs(len(a) - len(b)) > 2:
+        return 3
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(cur[-1] + 1, prev[j] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+_LEGAL_BY_SKELETON: dict[str, tuple[str, ...]] = {}
+for _tok in NAME_STOP_TOKENS:
+    if len(_tok) >= 6:
+        _LEGAL_BY_SKELETON.setdefault(skeleton_word(_tok), []).append(_tok)
+_LEGAL_BY_SKELETON = {k: tuple(v) for k, v in _LEGAL_BY_SKELETON.items()}
+
+
+def _is_stop_token(token: str) -> bool:
+    """Legal, honorific, or alias token, including transliterations and one-edit typos."""
+    if token in NAME_STOP_TOKENS or token in PHONETIC_LEGAL_TOKENS:
+        return True
+    if len(token) < 5:
+        return False
+    canons = _LEGAL_BY_SKELETON.get(skeleton_word(token))
+    if not canons:
+        return False
+    return any(abs(len(token) - len(canon)) <= 2 and _edit_distance(token, canon) <= 2 for canon in canons)
 
 
 def name_skeleton(name_core: str) -> str:

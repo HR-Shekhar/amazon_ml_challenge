@@ -8,11 +8,32 @@ wheels/
 
 # Virtual environments
 .venv
+.venv*/
 
-# Challenge data and generated artifacts (large, reproducible from raw data)
+# Challenge data (large; not redistributed)
 student_resource/dataset/
-student_resource/output/*.tsv
-student_resource/code/business_entity_resolution/artifacts/
 __MACOSX/
 .DS_Store
+
+# Local experiments and caches
 scratch/
+**/cache/
+*.parquet
+
+# Generated models and run logs
+**/model/
+*.log
+
+# Intermediate / experimental submissions (keep only output2-v2)
+output/
+output3/
+output5/
+output-v3/
+student_resource/output/
+student_resource/kaggle_output/
+student_resource/modal_output/
+student_resource/code/business_entity_resolution/artifacts/
+
+# Keep the final public 0.968 submission
+!output2-v2/
+!output2-v2/matching_results.tsv

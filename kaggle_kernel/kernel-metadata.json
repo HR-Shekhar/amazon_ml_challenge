@@ -1,0 +1,16 @@
+{
+  "id": "h1manshushekhar/amazon-ml-entity-resolution",
+  "title": "amazon-ml-entity-resolution",
+  "code_file": "run.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_internet": "true",
+  "dataset_sources": [
+    "h1manshushekhar/amazon-ml-entity-data",
+    "h1manshushekhar/amazon-ml-entity-code"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

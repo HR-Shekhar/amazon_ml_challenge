@@ -1,25 +1,27 @@
-"""Candidate generation.
+"""Candidate generation, query side.
 
-Two stages, both run inside each country (the country label is an open string, never a
-hard-coded list):
+Every Source 2/3 record belongs to at most one Source 1 entity, so candidates are
+generated per Source 2/3 record (the "query"): its nearest Source 1 records, inside the
+query's country (an open string, never a hard-coded list). Three searches are unioned:
 
-1. Token blocking. Rare name tokens, phonetic-skeleton tokens, a compact-name prefix,
-   and street numbers are posted into inverted indexes. Keys that are too common are
-   dropped so one popular token cannot pull in thousands of unrelated businesses.
-   An exact compact-name hit is weighted high enough that the later cap cannot drop it.
-2. TF-IDF nearest neighbours. Hashed word/bigram TF-IDF of the normalized name (plus
-   its phonetic skeleton) and of the normalized address; each Source 2/3 record keeps
-   its closest Source 1 rows. This is what recovers typos and transliteration.
+1. Word TF-IDF of name (+ phonetic skeleton) and address, cosine top-n.
+2. Character-trigram TF-IDF of the compact name plus address words, cosine top-n. This
+   recovers typos, transliteration, and concatenated names.
+3. Rare inverted-index keys (name tokens, skeleton tokens, exact compact name, street
+   numbers). Keys common in Source 1 are dropped.
 
-The union is capped per Source 1 entity. ``recall_check`` reports how many ground-truth
-pairs survived — that number is the ceiling for everything downstream.
+Each query keeps its best ``max_candidates`` Source 1 records. ``recall_report`` gives
+the fraction of matched queries whose true owner survived (the ceiling downstream).
 """
 
 from __future__ import annotations
 
 import heapq
+import multiprocessing as mp
 import os
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
+from operator import itemgetter
 
 import numpy as np
 import pandas as pd
@@ -27,30 +29,28 @@ import scipy.sparse as sp
 from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.preprocessing import normalize
 
-from data_loading import name_skeleton
+from features import _transform
 
-_PAIR_BIG = np.int64(10_000_000_000)
+SCORE_NAMES = ("blk_word", "blk_char", "blk_votes")
 
 
 @dataclass
-class BlockResult:
-    s1_index: np.ndarray
-    s23_index: np.ndarray
-    votes: np.ndarray
-    tfidf: np.ndarray
+class Candidates:
+    """Pairs sorted by query. ``q`` indexes Source 2/3 rows, ``c`` Source 1 rows."""
+
+    q: np.ndarray
+    c: np.ndarray
+    scores: dict[str, np.ndarray] = field(default_factory=dict)
 
     def __len__(self) -> int:
-        return int(len(self.s1_index))
+        return int(len(self.q))
 
 
 def _strings(df: pd.DataFrame, column: str) -> np.ndarray:
-    if column == "name_skel" and column not in df.columns:
-        core = df["name_core"].fillna("").astype(str).tolist()
-        return np.array([name_skeleton(x) for x in core], dtype=object)
-    return df[column].fillna("").astype(str).to_numpy()
+    return df[column].fillna("").astype(str).to_numpy(dtype=object)
 
 
-def _row_keys(name_core: str, name_skel: str, name_compact: str, addr_nums: str) -> list[str]:
+def _row_keys(name_core: str, name_skel: str, name_compact: str, addr_nums: str, _addr_norm: str) -> list[str]:
     keys: list[str] = []
     parts = name_core.split()
     for tok in parts:
@@ -72,319 +72,284 @@ def _row_keys(name_core: str, name_skel: str, name_compact: str, addr_nums: str)
     return keys
 
 
-def _df_cap(key: str, n_rows: int) -> int:
-    scaled = max(25, min(80, n_rows // 30 or 25))
-    if key.startswith("e"):
-        return min(12, scaled)
-    return scaled
+def _n_jobs() -> int:
+    return max(1, (os.cpu_count() or 2) - 1)
 
 
-def _token_pairs(s1_local: np.ndarray, s23_local: np.ndarray, cols: dict[str, np.ndarray], max_keep: int) -> tuple[list[int], list[int], list[int]]:
-    """Return global-index lists (s1, s23, votes) from the inverted index."""
-    fields = ("name_core", "name_skel", "name_compact", "addr_nums")
-    s23_keys = [
-        _row_keys(*(str(cols[f][j]) for f in fields))
-        for j in range(len(s23_local))
-    ]
-    counts: dict[str, int] = {}
-    for keys in s23_keys:
-        for key in set(keys):
-            counts[key] = counts.get(key, 0) + 1
-    postings: dict[str, list[int]] = {}
-    for local_j, keys in enumerate(s23_keys):
-        for key in set(keys):
-            if counts[key] <= _df_cap(key, len(s23_local)):
-                postings.setdefault(key, []).append(local_j)
-
-    out_s1: list[int] = []
-    out_s23: list[int] = []
-    out_votes: list[int] = []
-    for local_i, gi in enumerate(s1_local):
-        scores: dict[int, int] = {}
-        for key in _row_keys(*(str(cols[f + "_s1"][local_i]) for f in fields)):
-            bucket = postings.get(key)
-            if not bucket:
-                continue
-            weight = 100 if key.startswith("e") else 1
-            for local_j in bucket:
-                scores[local_j] = scores.get(local_j, 0) + weight
-        if not scores:
-            continue
-        if len(scores) > max_keep:
-            chosen = heapq.nlargest(max_keep, scores.items(), key=lambda kv: kv[1])
-        else:
-            chosen = scores.items()
-        g_s23 = s23_local
-        for local_j, vote in chosen:
-            out_s1.append(int(gi))
-            out_s23.append(int(g_s23[local_j]))
-            out_votes.append(int(vote))
-    return out_s1, out_s23, out_votes
+# ---------------------------------------------------------------------------------------
+# TF-IDF searches
+# ---------------------------------------------------------------------------------------
 
 
-def _fit_idf(texts: list[str], n_features: int) -> tuple[HashingVectorizer, np.ndarray, np.ndarray]:
-    hasher = HashingVectorizer(
-        n_features=n_features,
-        ngram_range=(1, 2),
+def _hasher(analyzer: str, ngram: tuple[int, int]) -> HashingVectorizer:
+    return HashingVectorizer(
+        n_features=1 << 20,
+        analyzer=analyzer,
+        ngram_range=ngram,
         alternate_sign=False,
         norm=None,
-        token_pattern=r"\S+",
+        lowercase=False,
+        token_pattern=r"\S+" if analyzer == "word" else None,
         dtype=np.float32,
     )
-    matrix = hasher.transform(texts)
-    df = np.bincount(matrix.indices, minlength=n_features).astype(np.float32)
-    idf = (np.log((len(texts) + 1.0) / (df + 1.0)) + 1.0).astype(np.float32)
-    return hasher, idf, df
 
 
-def _weight(matrix: sp.csr_matrix, idf: np.ndarray, df: np.ndarray, cap: float, apply_cap: bool) -> sp.csr_matrix:
-    matrix = matrix.tocsr(copy=True)
-    if matrix.nnz == 0:
-        return matrix
-    scale = idf[matrix.indices]
-    if apply_cap:
-        scale = scale * (df[matrix.indices] <= cap)
-    matrix.data = matrix.data * scale
-    matrix.eliminate_zeros()
-    return normalize(matrix, norm="l2", copy=False)
+def _weighted(parts1: list[sp.csr_matrix], parts23: list[sp.csr_matrix], weights: list[float], cap: float) -> tuple[sp.csr_matrix, sp.csr_matrix]:
+    """IDF from Source 1, drop index terms with df above ``cap``, L2 per part, then weight."""
+    idx_parts, q_parts = [], []
+    for m1, m23, w in zip(parts1, parts23, weights):
+        df = np.bincount(m1.indices, minlength=m1.shape[1]).astype(np.float32)
+        idf = (np.log((m1.shape[0] + 1.0) / (df + 1.0)) + 1.0).astype(np.float32)
+        a = m1.copy()
+        a.data *= idf[a.indices] * (df[a.indices] <= cap)
+        a.eliminate_zeros()
+        b = m23.copy()
+        b.data *= idf[b.indices]
+        idx_parts.append(normalize(a, copy=False) * np.float32(w))
+        q_parts.append(normalize(b, copy=False) * np.float32(w))
+    return sp.hstack(idx_parts, format="csr"), sp.hstack(q_parts, format="csr")
 
 
-def _tfidf_pairs(
-    s1_local: np.ndarray,
-    s23_local: np.ndarray,
-    name_s1: np.ndarray,
-    addr_s1: np.ndarray,
-    skel_s1: np.ndarray,
-    name_s23: np.ndarray,
-    addr_s23: np.ndarray,
-    skel_s23: np.ndarray,
-    topn: int,
-    n_features: int,
-) -> tuple[list[int], list[int], list[float]]:
+def _topn(index: sp.csr_matrix, query: sp.csr_matrix, topn: int, n_jobs: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     from sparse_dot_topn import sp_matmul_topn
 
-    name1 = [f"{a} {b}".strip() for a, b in zip(name_s1, skel_s1)]
-    name2 = [f"{a} {b}".strip() for a, b in zip(name_s23, skel_s23)]
-    hasher_n, idf_n, df_n = _fit_idf(name1, n_features)
-    hasher_a, idf_a, df_a = _fit_idf(list(addr_s1), n_features)
-    cap = float(min(8000, max(300, len(s1_local) // 20 or 300)))
-    left = _weight(hasher_n.transform(name1), idf_n, df_n, cap, True)
-    right = _weight(hasher_a.transform(list(addr_s1)), idf_a, df_a, cap, True)
-    index = sp.hstack([left * np.float32(0.6), right * np.float32(0.8)], format="csr")
-    if index.nnz == 0:
-        return [], [], []
     index_t = index.T.tocsr()
-    threads = max(1, (os.cpu_count() or 2) - 1)
-    out_s1: list[int] = []
-    out_s23: list[int] = []
-    out_score: list[float] = []
-    chunk = 20_000
-    for start in range(0, len(s23_local), chunk):
-        stop = min(start + chunk, len(s23_local))
-        q_name = _weight(hasher_n.transform(name2[start:stop]), idf_n, df_n, cap, False)
-        q_addr = _weight(hasher_a.transform(list(addr_s23[start:stop])), idf_a, df_a, cap, False)
-        query = sp.hstack([q_name * np.float32(0.6), q_addr * np.float32(0.8)], format="csr")
-        if query.nnz == 0:
+    qs, cs, ss = [], [], []
+    step = 100_000
+    for start in range(0, query.shape[0], step):
+        part = query[start : start + step]
+        if part.nnz == 0:
             continue
-        hits = sp_matmul_topn(query, index_t, top_n=topn, n_threads=threads, sort=True)
-        for row in range(stop - start):
-            a, b = hits.indptr[row], hits.indptr[row + 1]
-            if a == b:
+        hits = sp_matmul_topn(part, index_t, top_n=topn, n_threads=n_jobs, sort=True)
+        rows = np.repeat(np.arange(hits.shape[0], dtype=np.int64), np.diff(hits.indptr)) + start
+        qs.append(rows)
+        cs.append(hits.indices.astype(np.int64))
+        ss.append(hits.data.astype(np.float32))
+    if not qs:
+        return np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0, np.float32)
+    return np.concatenate(qs), np.concatenate(cs), np.concatenate(ss)
+
+
+# ---------------------------------------------------------------------------------------
+# Token keys
+# ---------------------------------------------------------------------------------------
+
+_TOKEN_STATE: dict = {}
+
+
+def _token_slice(bounds: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    a, b = bounds
+    postings = _TOKEN_STATE["postings"]
+    keys23 = _TOKEN_STATE["keys23"]
+    keep = _TOKEN_STATE["keep"]
+    oq: list[int] = []
+    oc: list[int] = []
+    ov: list[int] = []
+    for j in range(a, b):
+        scores: dict[int, int] = {}
+        for key in keys23[j]:
+            bucket = postings.get(key)
+            if bucket is None:
                 continue
-            gi23 = int(s23_local[start + row])
-            for col, score in zip(hits.indices[a:b], hits.data[a:b]):
-                out_s23.append(gi23)
-                out_s1.append(int(s1_local[int(col)]))
-                out_score.append(float(score))
-    return out_s1, out_s23, out_score
+            w = 20 if key[0] == "e" else 1
+            for i in bucket:
+                scores[i] = scores.get(i, 0) + w
+        if not scores:
+            continue
+        items = heapq.nlargest(keep, scores.items(), key=itemgetter(1)) if len(scores) > keep else scores.items()
+        for i, v in items:
+            oq.append(j)
+            oc.append(i)
+            ov.append(v)
+    return np.asarray(oq, np.int64), np.asarray(oc, np.int64), np.asarray(ov, np.float32)
 
 
-def _dedupe_and_cap(
-    s1: np.ndarray,
-    s23: np.ndarray,
-    votes: np.ndarray,
-    tfidf: np.ndarray,
-    max_candidates: int,
-) -> BlockResult:
-    if len(s1) == 0:
-        empty_i = np.empty(0, np.int32)
-        empty_f = np.empty(0, np.float32)
-        return BlockResult(empty_i, empty_i, empty_i, empty_f)
-    order = np.lexsort((s23, s1))
-    s1, s23, votes, tfidf = s1[order], s23[order], votes[order], tfidf[order]
-    change = np.empty(len(s1), dtype=bool)
-    change[0] = True
-    change[1:] = (s1[1:] != s1[:-1]) | (s23[1:] != s23[:-1])
-    starts = np.flatnonzero(change)
-    votes = np.maximum.reduceat(votes, starts)
-    tfidf = np.maximum.reduceat(tfidf, starts)
-    s1, s23 = s1[change], s23[change]
-    # Exact-name votes are ~100. A TF-IDF hit gets a flat bonus so the cap cannot
-    # throw away the nearest neighbours in favour of weak token votes.
-    score = votes.astype(np.float32) + np.float32(20.0) * (tfidf > 0) + np.float32(5.0) * tfidf
-    order = np.lexsort((-score, s1))
-    s1, s23, votes, tfidf = s1[order], s23[order], votes[order], tfidf[order]
-    idx = np.arange(len(s1))
-    group_mark = np.where(np.diff(s1, prepend=np.int64(s1[0]) - 1) != 0, idx, 0)
-    rank = idx - np.maximum.accumulate(group_mark)
-    keep = rank < max_candidates
-    return BlockResult(
-        s1[keep].astype(np.int32, copy=False),
-        s23[keep].astype(np.int32, copy=False),
-        votes[keep].astype(np.int32, copy=False),
-        tfidf[keep].astype(np.float32, copy=False),
-    )
+def _token_search(cols1: dict[str, np.ndarray], cols23: dict[str, np.ndarray], keep: int, cap: int, n_jobs: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    f = ("name_core", "name_skel", "name_compact", "addr_nums", "addr_norm")
+    keys1 = [set(_row_keys(*vals)) for vals in zip(*(cols1[x] for x in f))]
+    counts: dict[str, int] = {}
+    for ks in keys1:
+        for k in ks:
+            counts[k] = counts.get(k, 0) + 1
+    postings: dict[str, list[int]] = {}
+    for li, ks in enumerate(keys1):
+        for k in ks:
+            if counts[k] <= cap:
+                postings.setdefault(k, []).append(li)
+    del keys1, counts
+    keys23 = [set(_row_keys(*vals)) for vals in zip(*(cols23[x] for x in f))]
+    step = 100_000
+    bounds = [(a, min(a + step, len(keys23))) for a in range(0, len(keys23), step)]
+    _TOKEN_STATE.update(postings=postings, keys23=keys23, keep=keep)
+    try:
+        if len(bounds) > 1 and "fork" in mp.get_all_start_methods():
+            with mp.get_context("fork").Pool(n_jobs) as pool:
+                parts = pool.map(_token_slice, bounds)
+        else:
+            parts = [_token_slice(b) for b in bounds]
+    finally:
+        _TOKEN_STATE.clear()
+    if not parts:
+        return np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0, np.float32)
+    return (np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts]), np.concatenate([p[2] for p in parts]))
+
+
+# ---------------------------------------------------------------------------------------
+# Union and cap
+# ---------------------------------------------------------------------------------------
+
+
+def _topk_mask(q: np.ndarray, score: np.ndarray, k: int) -> np.ndarray:
+    """True at the ``k`` highest ``score`` rows within each query. ``q`` need not be sorted."""
+    keep = np.zeros(len(q), dtype=bool)
+    if len(q) == 0 or k <= 0:
+        return keep
+    order = np.lexsort((-score, q))
+    qs = q[order]
+    start = np.r_[True, qs[1:] != qs[:-1]]
+    first = np.maximum.accumulate(np.where(start, np.arange(len(q)), 0))
+    keep[order[(np.arange(len(q)) - first) < k]] = True
+    return keep
+
+
+def rank_score(scores: dict[str, np.ndarray]) -> np.ndarray:
+    return np.maximum(scores["blk_word"], scores["blk_char"]) + np.float32(0.01) * np.minimum(scores["blk_votes"], 40)
+
+
+def _union(lists: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]], n_c: int, max_candidates: int) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    q = np.concatenate([x[1] for x in lists])
+    c = np.concatenate([x[2] for x in lists])
+    uniq, inverse = np.unique(q * np.int64(n_c) + c, return_inverse=True)
+    scores = {}
+    offset = 0
+    for name, lq, _, ls in lists:
+        arr = np.zeros(len(uniq), np.float32)
+        np.maximum.at(arr, inverse[offset : offset + len(lq)], ls)
+        scores[name] = arr
+        offset += len(lq)
+    uq = uniq // n_c
+    uc = uniq % n_c
+    # One blended ranking, top ``max_candidates``. This is the candidate list behind
+    # the 0.968 submission. Reserved token slots were measured and did not raise recall.
+    keep = _topk_mask(uq, rank_score(scores), max_candidates)
+    uq, uc = uq[keep], uc[keep]
+    scores = {k: v[keep] for k, v in scores.items()}
+    order = np.lexsort((-rank_score(scores), uq))
+    return uq[order], uc[order], {k: v[order] for k, v in scores.items()}
 
 
 def block(
     s1: pd.DataFrame,
     s23: pd.DataFrame,
-    topn: int = 12,
-    max_candidates: int = 40,
-    n_features: int = 1 << 20,
-) -> BlockResult:
-    """Build the candidate pairs the matcher will score. One country at a time."""
-    if len(s1) == 0 or len(s23) == 0:
-        empty_i = np.empty(0, np.int32)
-        return BlockResult(empty_i, empty_i, empty_i, np.empty(0, np.float32))
-
+    topn: int = 20,
+    max_candidates: int = 12,
+    token_keep: int = 10,
+    token_cap: int = 60,
+    n_jobs: int | None = None,
+) -> Candidates:
+    """Candidate Source 1 rows for every Source 2/3 row, one country at a time."""
     c1 = _strings(s1, "country")
     c23 = _strings(s23, "country")
-    pieces_s1: list[np.ndarray] = []
-    pieces_s23: list[np.ndarray] = []
-    pieces_votes: list[np.ndarray] = []
-    pieces_tfidf: list[np.ndarray] = []
-
-    for country in sorted(set(c1.tolist()) | set(c23.tolist())):
-        s1_local = np.flatnonzero(c1 == country)
-        s23_local = np.flatnonzero(c23 == country)
-        print(f"blocking {country or '(blank)'}: source1={len(s1_local):,} source2/3={len(s23_local):,}", flush=True)
-        if len(s1_local) == 0 or len(s23_local) == 0:
-            continue
-        cols = {
-            "name_core": _strings(s23, "name_core")[s23_local],
-            "name_skel": _strings(s23, "name_skel")[s23_local],
-            "name_compact": _strings(s23, "name_compact")[s23_local],
-            "addr_nums": _strings(s23, "addr_nums")[s23_local],
-            "name_core_s1": _strings(s1, "name_core")[s1_local],
-            "name_skel_s1": _strings(s1, "name_skel")[s1_local],
-            "name_compact_s1": _strings(s1, "name_compact")[s1_local],
-            "addr_nums_s1": _strings(s1, "addr_nums")[s1_local],
-        }
-        t_s1, t_s23, t_votes = _token_pairs(s1_local, s23_local, cols, max_candidates)
-        f_s1: list[int] = []
-        f_s23: list[int] = []
-        f_score: list[float] = []
-        if len(s1_local) >= 8 and len(s23_local) >= 8:
-            try:
-                f_s1, f_s23, f_score = _tfidf_pairs(
-                    s1_local,
-                    s23_local,
-                    cols["name_core_s1"],
-                    _strings(s1, "addr_norm")[s1_local],
-                    cols["name_skel_s1"],
-                    cols["name_core"],
-                    _strings(s23, "addr_norm")[s23_local],
-                    cols["name_skel"],
-                    topn,
-                    n_features,
-                )
-            except Exception as exc:
-                print(f"  tfidf blocking skipped for {country}: {exc}", flush=True)
-        s1_cat = np.concatenate([np.asarray(t_s1, np.int32), np.asarray(f_s1, np.int32)]) if (t_s1 or f_s1) else np.empty(0, np.int32)
-        s23_cat = np.concatenate([np.asarray(t_s23, np.int32), np.asarray(f_s23, np.int32)]) if (t_s1 or f_s1) else np.empty(0, np.int32)
-        votes = np.concatenate([np.asarray(t_votes, np.int32), np.zeros(len(f_s1), np.int32)]) if (t_s1 or f_s1) else np.empty(0, np.int32)
-        tfidf = np.concatenate([np.zeros(len(t_s1), np.float32), np.asarray(f_score, np.float32)]) if (t_s1 or f_s1) else np.empty(0, np.float32)
-        if len(s1_cat) == 0:
-            print("  candidates=0", flush=True)
-            continue
-        capped = _dedupe_and_cap(s1_cat, s23_cat, votes, tfidf, max_candidates)
-        print(f"  candidates={len(capped):,}", flush=True)
-        pieces_s1.append(capped.s1_index)
-        pieces_s23.append(capped.s23_index)
-        pieces_votes.append(capped.votes)
-        pieces_tfidf.append(capped.tfidf)
-
-    if not pieces_s1:
-        empty_i = np.empty(0, np.int32)
-        return BlockResult(empty_i, empty_i, empty_i, np.empty(0, np.float32))
-    return BlockResult(
-        np.concatenate(pieces_s1),
-        np.concatenate(pieces_s23),
-        np.concatenate(pieces_votes),
-        np.concatenate(pieces_tfidf),
-    )
+    out_q, out_c = [], []
+    out_s: dict[str, list[np.ndarray]] = {k: [] for k in SCORE_NAMES}
+    fields = ("name_core", "name_skel", "name_compact", "addr_norm", "addr_nums")
+    all1 = {f: _strings(s1, f) for f in fields}
+    all23 = {f: _strings(s23, f) for f in fields}
+    for country in sorted(set(c1.tolist()) & set(c23.tolist())):
+        t0 = time.time()
+        i1 = np.flatnonzero(c1 == country)
+        i23 = np.flatnonzero(c23 == country)
+        print(f"blocking {country or '(blank)'}: source1={len(i1):,} source2/3={len(i23):,}", flush=True)
+        cols1 = {f: all1[f][i1] for f in fields}
+        cols23 = {f: all23[f][i23] for f in fields}
+        cap = float(min(8000, max(300, len(i1) // 20)))
+        jobs = n_jobs or _n_jobs()
+        lists = []
+        if len(i1) >= 2:
+            name1 = np.array([f"{a} {b}".strip() for a, b in zip(cols1["name_core"], cols1["name_skel"])], dtype=object)
+            name23 = np.array([f"{a} {b}".strip() for a, b in zip(cols23["name_core"], cols23["name_skel"])], dtype=object)
+            word = _hasher("word", (1, 2))
+            char = _hasher("char", (3, 3))
+            a1 = _transform(word, cols1["addr_norm"], jobs)
+            a23 = _transform(word, cols23["addr_norm"], jobs)
+            index, query = _weighted([_transform(word, name1, jobs), a1], [_transform(word, name23, jobs), a23], [0.6, 0.8], cap)
+            q, c, s = _topn(index, query, topn, jobs)
+            lists.append(("blk_word", q, c, s))
+            print(f"  word tfidf: {len(q):,} pairs ({time.time() - t0:.0f}s)", flush=True)
+            index, query = _weighted([_transform(char, cols1["name_compact"], jobs), a1], [_transform(char, cols23["name_compact"], jobs), a23], [0.7, 0.7], cap)
+            del a1, a23
+            q, c, s = _topn(index, query, topn, jobs)
+            lists.append(("blk_char", q, c, s))
+            del index, query
+            print(f"  char tfidf: {len(q):,} pairs ({time.time() - t0:.0f}s)", flush=True)
+        q, c, s = _token_search(cols1, cols23, token_keep, token_cap, jobs)
+        lists.append(("blk_votes", q, c, s))
+        print(f"  token keys: {len(q):,} pairs ({time.time() - t0:.0f}s)", flush=True)
+        present = {x[0] for x in lists}
+        for name in SCORE_NAMES:
+            if name not in present:
+                lists.append((name, np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0, np.float32)))
+        uq, uc, scores = _union(lists, len(i1), max_candidates)
+        out_q.append(i23[uq].astype(np.int32))
+        out_c.append(i1[uc].astype(np.int32))
+        for k in SCORE_NAMES:
+            out_s[k].append(scores[k])
+        print(f"  candidates={len(uq):,} ({time.time() - t0:.0f}s)", flush=True)
+    if not out_q:
+        return Candidates(np.empty(0, np.int32), np.empty(0, np.int32), {k: np.empty(0, np.float32) for k in SCORE_NAMES})
+    q = np.concatenate(out_q)
+    c = np.concatenate(out_c)
+    order = np.argsort(q, kind="stable")
+    return Candidates(q[order], c[order], {k: np.concatenate(v)[order] for k, v in out_s.items()})
 
 
-def recall_check(candidates: BlockResult, truth: dict[int, np.ndarray], countries: np.ndarray | None = None) -> dict[str, float]:
-    """Pair recall of ``candidates`` against ground truth.
+def add_source1_scores(cands: Candidates) -> None:
+    """How contested each Source 1 candidate is, across all queries.
 
-    Pair recall is the fraction of true (source1, source2/3) links that appear in the
-    candidate set. Entity recall is the fraction of non-singleton Source 1 entities
-    whose true links are *all* present. Both are ceilings on the matcher.
+    ``s1_n_queries``: queries listing this Source 1 row. ``s1_n_top``: queries where it
+    is the best-ranked candidate. ``rev_rank`` / ``rev_gap``: this query's rank among all
+    queries listing the same Source 1 row, and its gap to the best other one.
     """
-    true_s1: list[np.ndarray] = []
-    true_s23: list[np.ndarray] = []
-    singletons = 0
+    from features import group_rank_gap
+
+    best = rank_score(cands.scores)
+    cands.scores["blk_best"] = best
+    c = cands.c.astype(np.int64)
+    _, inv, counts = np.unique(c, return_inverse=True, return_counts=True)
+    cands.scores["s1_n_queries"] = counts[inv].astype(np.float32)
+    q_rank, _ = group_rank_gap(cands.q.astype(np.int64), best)
+    top = np.bincount(inv, weights=(q_rank == 0).astype(np.float64), minlength=len(counts))
+    cands.scores["s1_n_top"] = top[inv].astype(np.float32)
+    rev_rank, rev_gap = group_rank_gap(c, best)
+    cands.scores["rev_rank"] = rev_rank
+    cands.scores["rev_gap"] = rev_gap
+
+
+def owner_array(n_s23: int, truth: dict[int, np.ndarray]) -> np.ndarray:
+    """``owner[j]`` is the Source 1 row that Source 2/3 row ``j`` belongs to, or -1."""
+    owner = np.full(n_s23, -1, np.int64)
     for row, linked in truth.items():
-        if linked is None or len(linked) == 0:
-            singletons += 1
+        if len(linked):
+            owner[np.asarray(linked, np.int64)] = int(row)
+    return owner
+
+
+def recall_report(cands: Candidates, owner: np.ndarray, countries23: np.ndarray, ks: tuple[int, ...] = (1, 2, 3, 5, 8, 12, 20)) -> str:
+    """Fraction of matched Source 2/3 rows whose owner is in their top-k candidates."""
+    order = np.lexsort((-rank_score(cands.scores), cands.q))
+    q, c = cands.q[order].astype(np.int64), cands.c[order].astype(np.int64)
+    start = np.r_[True, q[1:] != q[:-1]]
+    rank = np.arange(len(q)) - np.maximum.accumulate(np.where(start, np.arange(len(q)), 0))
+    hit_rank = np.full(len(owner), np.iinfo(np.int64).max, np.int64)
+    hit = owner[q] == c
+    np.minimum.at(hit_rank, q[hit], rank[hit])
+    matched = owner >= 0
+    lines = ["blocking recall (Source 2/3 rows whose owner is among their candidates)"]
+    lines.append(f"  candidate pairs: {len(q):,}  mean per query: {len(q) / max(1, len(np.unique(q))):.2f}")
+    for country in ["(all)"] + sorted(set(countries23[matched].tolist())):
+        mask = matched if country == "(all)" else matched & (countries23 == country)
+        if not mask.any():
             continue
-        true_s1.append(np.full(len(linked), int(row), np.int64))
-        true_s23.append(np.asarray(linked, np.int64))
-    n_s1 = len(truth)
-    n_cand = len(candidates)
-    report: dict[str, float] = {
-        "source1_entities": float(n_s1),
-        "singletons": float(singletons),
-        "true_pairs": 0.0,
-        "candidate_pairs": float(n_cand),
-        "mean_candidates": float(n_cand / n_s1) if n_s1 else 0.0,
-        "pair_recall": 1.0 if singletons == n_s1 else 0.0,
-        "entity_recall": 1.0 if singletons == n_s1 else 0.0,
-    }
-    if not true_s1:
-        return report
-    ts1 = np.concatenate(true_s1)
-    ts23 = np.concatenate(true_s23)
-    tkeys = ts1 * _PAIR_BIG + ts23
-    order_t = np.argsort(tkeys, kind="mergesort")
-    tkeys = tkeys[order_t]
-    ts1 = ts1[order_t]
-    if n_cand:
-        ckeys = candidates.s1_index.astype(np.int64) * _PAIR_BIG + candidates.s23_index.astype(np.int64)
-        ckeys.sort()
-        idx = np.searchsorted(ckeys, tkeys)
-        in_range = idx < len(ckeys)
-        hit = np.zeros(len(tkeys), dtype=bool)
-        hit[in_range] = ckeys[idx[in_range]] == tkeys[in_range]
-    else:
-        hit = np.zeros(len(tkeys), dtype=bool)
-    report["true_pairs"] = float(len(tkeys))
-    report["pair_recall"] = float(hit.mean())
-    starts = np.flatnonzero(np.diff(ts1, prepend=ts1[0] - 1))
-    complete = np.minimum.reduceat(hit.astype(np.int8), starts)
-    report["entity_recall"] = float(complete.mean())
-    if countries is not None:
-        ent_country = countries[ts1[starts]]
-        for country in sorted(set(ent_country.tolist())):
-            mask = ent_country == country
-            report[f"entity_recall[{country}]"] = float(complete[mask].mean()) if mask.any() else 0.0
-            # pair recall by the entity's country
-            pair_country = countries[ts1]
-            pmask = pair_country == country
-            report[f"pair_recall[{country}]"] = float(hit[pmask].mean()) if pmask.any() else 0.0
-    return report
-
-
-def format_recall(report: dict[str, float]) -> str:
-    lines = ["blocking recall (ceiling for the matcher)"]
-    for key in ("source1_entities", "singletons", "true_pairs", "candidate_pairs", "mean_candidates", "pair_recall", "entity_recall"):
-        value = report[key]
-        if key.endswith("recall") or key == "mean_candidates":
-            lines.append(f"  {key}: {value:.4f}")
-        else:
-            lines.append(f"  {key}: {int(value)}")
-    for key in sorted(k for k in report if k not in lines and "[" in k):
-        lines.append(f"  {key}: {report[key]:.4f}")
+        parts = [f"r@{k}={np.mean(hit_rank[mask] < k):.4f}" for k in ks]
+        lines.append(f"  {country}: n={int(mask.sum()):,} " + " ".join(parts) + f" any={np.mean(hit_rank[mask] < np.iinfo(np.int64).max):.4f}")
     return "\n".join(lines)
